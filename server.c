@@ -1,10 +1,11 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <time.h>
 #include <errno.h>
 #include <limits.h>
@@ -21,6 +22,16 @@ typedef struct {
     time_t start_time;
 } ServerState;
 
+typedef struct {
+    int client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+} ClientInfo;
+
+typedef struct {
+    int status;
+    int body_len;
+} ResponseInfo;
+
 static ServerState state = {
     .health_up = 1,
     .wait_seconds = 0,
@@ -29,10 +40,32 @@ static ServerState state = {
 };
 
 static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void *allocations[MAX_ALLOCATIONS];
 static int alloc_count = 0;
 
-static void send_response(int client, int status, const char *status_text, const char *body) {
+static void log_request(const char *client_ip, const char *request_line,
+                        int status, int body_len,
+                        const char *referer, const char *user_agent) {
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    char time_buf[64];
+    strftime(time_buf, sizeof(time_buf), "%d/%b/%Y:%H:%M:%S %z", tm_info);
+
+    pthread_mutex_lock(&log_mutex);
+    printf("%s - - [%s] \"%s\" %d %d \"%s\" \"%s\"\n",
+           client_ip,
+           time_buf,
+           request_line,
+           status,
+           body_len,
+           referer ? referer : "-",
+           user_agent ? user_agent : "-");
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+static ResponseInfo send_response(int client, int status, const char *status_text, const char *body) {
     char response[BUFFER_SIZE];
     int body_len = strlen(body);
     int len = snprintf(response, sizeof(response),
@@ -44,24 +77,25 @@ static void send_response(int client, int status, const char *status_text, const
         "%s",
         status, status_text, body_len, body);
     write(client, response, len);
+    return (ResponseInfo){.status = status, .body_len = body_len};
 }
 
-static void send_json_ok(int client, const char *body) {
-    send_response(client, 200, "OK", body);
+static ResponseInfo send_json_ok(int client, const char *body) {
+    return send_response(client, 200, "OK", body);
 }
 
-static void send_bad_request(int client, const char *msg) {
+static ResponseInfo send_bad_request(int client, const char *msg) {
     char body[256];
     snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
-    send_response(client, 400, "Bad Request", body);
+    return send_response(client, 400, "Bad Request", body);
 }
 
-static void send_not_found(int client) {
-    send_response(client, 404, "Not Found", "{\"error\":\"not found\"}");
+static ResponseInfo send_not_found(int client) {
+    return send_response(client, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
-static void send_method_not_allowed(int client) {
-    send_response(client, 405, "Method Not Allowed", "{\"error\":\"method not allowed\"}");
+static ResponseInfo send_method_not_allowed(int client) {
+    return send_response(client, 405, "Method Not Allowed", "{\"error\":\"method not allowed\"}");
 }
 
 static int parse_positive_int(const char *s, int *out) {
@@ -78,7 +112,23 @@ static int starts_with(const char *str, const char *prefix) {
     return strncmp(str, prefix, strlen(prefix)) == 0;
 }
 
-static void handle_get_root(int client) {
+static char *find_header(const char *headers, const char *name) {
+    char search[128];
+    snprintf(search, sizeof(search), "\r\n%s: ", name);
+    char *start = strcasestr(headers, search);
+    if (!start) return NULL;
+    start += strlen(search);
+    char *end = strstr(start, "\r\n");
+    if (!end) return NULL;
+    size_t len = end - start;
+    char *value = malloc(len + 1);
+    if (!value) return NULL;
+    memcpy(value, start, len);
+    value[len] = '\0';
+    return value;
+}
+
+static ResponseInfo handle_get_root(int client) {
     char body[512];
     pthread_mutex_lock(&state_mutex);
     time_t uptime = time(NULL) - state.start_time;
@@ -86,10 +136,10 @@ static void handle_get_root(int client) {
         "{\"uptime\":%ld,\"allocated_memory_mb\":%zu,\"health_state\":\"%s\",\"wait_seconds\":%d}",
         (long)uptime, state.allocated_mb, state.health_up ? "up" : "down", state.wait_seconds);
     pthread_mutex_unlock(&state_mutex);
-    send_json_ok(client, body);
+    return send_json_ok(client, body);
 }
 
-static void handle_get_up(int client) {
+static ResponseInfo handle_get_up(int client) {
     pthread_mutex_lock(&state_mutex);
     int wait_secs = state.wait_seconds;
     int healthy = state.health_up;
@@ -99,52 +149,49 @@ static void handle_get_up(int client) {
         sleep(wait_secs);
     }
     if (healthy) {
-        send_response(client, 200, "OK", "{\"status\":\"healthy\"}");
+        return send_response(client, 200, "OK", "{\"status\":\"healthy\"}");
     } else {
-        send_response(client, 500, "Internal Server Error", "{\"status\":\"unhealthy\"}");
+        return send_response(client, 500, "Internal Server Error", "{\"status\":\"unhealthy\"}");
     }
 }
 
-static void handle_post_up_down(int client) {
+static ResponseInfo handle_post_up_down(int client) {
     pthread_mutex_lock(&state_mutex);
     state.health_up = 0;
     pthread_mutex_unlock(&state_mutex);
-    send_json_ok(client, "{\"health_state\":\"down\",\"message\":\"health set to down\"}");
+    return send_json_ok(client, "{\"health_state\":\"down\",\"message\":\"health set to down\"}");
 }
 
-static void handle_post_up_up(int client) {
+static ResponseInfo handle_post_up_up(int client) {
     pthread_mutex_lock(&state_mutex);
     state.health_up = 1;
     pthread_mutex_unlock(&state_mutex);
-    send_json_ok(client, "{\"health_state\":\"up\",\"message\":\"health set to up\"}");
+    return send_json_ok(client, "{\"health_state\":\"up\",\"message\":\"health set to up\"}");
 }
 
-static void handle_post_up_wait(int client, const char *seconds_str) {
+static ResponseInfo handle_post_up_wait(int client, const char *seconds_str) {
     int seconds;
     if (parse_positive_int(seconds_str, &seconds) < 0) {
-        send_bad_request(client, "invalid seconds value");
-        return;
+        return send_bad_request(client, "invalid seconds value");
     }
     pthread_mutex_lock(&state_mutex);
     state.wait_seconds = seconds;
     pthread_mutex_unlock(&state_mutex);
     char body[128];
     snprintf(body, sizeof(body), "{\"wait_seconds\":%d,\"message\":\"wait time configured\"}", seconds);
-    send_json_ok(client, body);
+    return send_json_ok(client, body);
 }
 
-static void handle_post_alloc(int client, const char *mb_str) {
+static ResponseInfo handle_post_alloc(int client, const char *mb_str) {
     int mb;
     if (parse_positive_int(mb_str, &mb) < 0 || mb <= 0) {
-        send_bad_request(client, "invalid mb value (must be positive integer)");
-        return;
+        return send_bad_request(client, "invalid mb value (must be positive integer)");
     }
 
     size_t bytes = (size_t)mb * 1024 * 1024;
     void *ptr = malloc(bytes);
     if (!ptr) {
-        send_response(client, 500, "Internal Server Error", "{\"error\":\"allocation failed\"}");
-        return;
+        return send_response(client, 500, "Internal Server Error", "{\"error\":\"allocation failed\"}");
     }
 
     // Touch every page to commit memory (assuming 4KB pages)
@@ -164,62 +211,58 @@ static void handle_post_alloc(int client, const char *mb_str) {
 
     char body[128];
     snprintf(body, sizeof(body), "{\"allocated_mb\":%d,\"total_allocated_mb\":%zu}", mb, total);
-    send_json_ok(client, body);
+    return send_json_ok(client, body);
 }
 
-static void handle_request(int client, const char *method, const char *path) {
+static ResponseInfo handle_request(int client, const char *method, const char *path) {
     // GET /
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
-        handle_get_root(client);
-        return;
+        return handle_get_root(client);
     }
 
     // GET /up
     if (strcmp(method, "GET") == 0 && strcmp(path, "/up") == 0) {
-        handle_get_up(client);
-        return;
+        return handle_get_up(client);
     }
 
     // POST /down
     if (strcmp(method, "POST") == 0 && strcmp(path, "/down") == 0) {
-        handle_post_up_down(client);
-        return;
+        return handle_post_up_down(client);
     }
 
     // POST /up
     if (strcmp(method, "POST") == 0 && strcmp(path, "/up") == 0) {
-        handle_post_up_up(client);
-        return;
+        return handle_post_up_up(client);
     }
 
     // POST /wait/{seconds}
     if (strcmp(method, "POST") == 0 && starts_with(path, "/wait/")) {
         const char *seconds_str = path + strlen("/wait/");
-        handle_post_up_wait(client, seconds_str);
-        return;
+        return handle_post_up_wait(client, seconds_str);
     }
 
     // POST /alloc/{mb}
     if (strcmp(method, "POST") == 0 && starts_with(path, "/alloc/")) {
         const char *mb_str = path + strlen("/alloc/");
-        handle_post_alloc(client, mb_str);
-        return;
+        return handle_post_alloc(client, mb_str);
     }
 
     // Check if path exists but method is wrong
     if (strcmp(path, "/") == 0 || strcmp(path, "/up") == 0 ||
         strcmp(path, "/down") == 0 || starts_with(path, "/wait/") ||
         starts_with(path, "/alloc/")) {
-        send_method_not_allowed(client);
-        return;
+        return send_method_not_allowed(client);
     }
 
-    send_not_found(client);
+    return send_not_found(client);
 }
 
 static void *handle_client(void *arg) {
-    int client = *(int *)arg;
-    free(arg);
+    ClientInfo *info = (ClientInfo *)arg;
+    int client = info->client_fd;
+    char client_ip[INET_ADDRSTRLEN];
+    strncpy(client_ip, info->client_ip, INET_ADDRSTRLEN);
+    free(info);
 
     char buffer[BUFFER_SIZE];
     ssize_t n = read(client, buffer, sizeof(buffer) - 1);
@@ -232,24 +275,39 @@ static void *handle_client(void *arg) {
     // Parse request line: METHOD PATH HTTP/1.x
     char method[16] = {0};
     char path[256] = {0};
+    char http_version[16] = {0};
     char *line_end = strstr(buffer, "\r\n");
     if (!line_end) {
-        send_bad_request(client, "malformed request");
+        ResponseInfo resp = send_bad_request(client, "malformed request");
+        log_request(client_ip, "-", resp.status, resp.body_len, NULL, NULL);
         close(client);
         return NULL;
     }
 
-    if (sscanf(buffer, "%15s %255s", method, path) != 2) {
-        send_bad_request(client, "malformed request line");
+    if (sscanf(buffer, "%15s %255s %15s", method, path, http_version) != 3) {
+        ResponseInfo resp = send_bad_request(client, "malformed request line");
+        log_request(client_ip, "-", resp.status, resp.body_len, NULL, NULL);
         close(client);
         return NULL;
     }
+
+    // Build request line for logging (before modifying path)
+    char request_line[512];
+    snprintf(request_line, sizeof(request_line), "%s %s %s", method, path, http_version);
+
+    // Parse headers
+    char *referer = find_header(buffer, "Referer");
+    char *user_agent = find_header(buffer, "User-Agent");
 
     // Remove query string if present
     char *query = strchr(path, '?');
     if (query) *query = '\0';
 
-    handle_request(client, method, path);
+    ResponseInfo resp = handle_request(client, method, path);
+    log_request(client_ip, request_line, resp.status, resp.body_len, referer, user_agent);
+
+    free(referer);
+    free(user_agent);
     close(client);
     return NULL;
 }
@@ -299,29 +357,32 @@ int main(void) {
     printf("Server listening on port %d\n", port);
 
     while (1) {
-        int client = accept(server_fd, NULL, NULL);
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client < 0) {
             if (errno == EINTR) continue;
             perror("accept");
             continue;
         }
 
-        int *client_fd = malloc(sizeof(int));
-        if (!client_fd) {
+        ClientInfo *info = malloc(sizeof(ClientInfo));
+        if (!info) {
             close(client);
             continue;
         }
-        *client_fd = client;
+        info->client_fd = client;
+        inet_ntop(AF_INET, &client_addr.sin_addr, info->client_ip, INET_ADDRSTRLEN);
 
         pthread_t thread;
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-        if (pthread_create(&thread, &attr, handle_client, client_fd) != 0) {
+        if (pthread_create(&thread, &attr, handle_client, info) != 0) {
             perror("pthread_create");
             close(client);
-            free(client_fd);
+            free(info);
         }
 
         pthread_attr_destroy(&attr);
