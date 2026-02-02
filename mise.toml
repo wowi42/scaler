@@ -1,0 +1,12 @@
+[tasks.build]
+description = "Build the server"
+run = "gcc -Wall -Wextra -O2 -pthread -o server server.c"
+
+[tasks.run]
+description = "Build and run the server"
+depends = ["build"]
+run = "./server"
+
+[tasks.clean]
+description = "Remove built artifacts"
+run = "rm -f server"
