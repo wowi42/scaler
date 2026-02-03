@@ -1,6 +1,17 @@
-# HTTP Server
+# Scaler
 
-A single-file C HTTP server for testing health checks and memory allocation.
+A lightweight HTTP server designed for testing automatic scaling scenarios across different cloud providers.
+
+## Purpose
+
+This tool simulates workloads and health conditions to test how cloud auto-scaling systems respond to various scenarios:
+
+- **Health check behavior** - Test how load balancers and orchestrators react when instances become unhealthy
+- **Slow health responses** - Simulate degraded instances with configurable response delays
+- **Memory pressure** - Trigger memory-based scaling policies by allocating controlled amounts of memory
+- **Instance lifecycle** - Verify scaling decisions during instance startup, degradation, and recovery
+
+Use this to validate your auto-scaling configurations on AWS, GCP, Azure, Kubernetes, or any platform with health-check-based scaling.
 
 ## Build and Run
 
@@ -128,41 +139,54 @@ Response:
 {"allocated_mb":50,"total_allocated_mb":150}
 ```
 
-## Example Session
+## Scaling Test Scenarios
+
+### Test 1: Instance Failure
+
+Simulate an unhealthy instance to verify the auto-scaler replaces it:
 
 ```bash
-# Start the server
-mise run run &
-
-# Check initial status
-curl http://localhost:8080/
-
-# Verify health
-curl http://localhost:8080/up
-
-# Set health to down
+# Mark instance as unhealthy
 curl -X POST http://localhost:8080/down
 
-# Verify health check now returns 500
-curl -w "\nHTTP Status: %{http_code}\n" http://localhost:8080/up
+# Auto-scaler should detect failed health checks and replace the instance
+```
 
-# Set health back to up
+### Test 2: Slow Instance Response
+
+Test timeout-based health check failures:
+
+```bash
+# Configure 30 second delay (exceeds typical health check timeout)
+curl -X POST http://localhost:8080/wait/30
+
+# Health checks will timeout, triggering replacement
+```
+
+### Test 3: Memory-Based Scaling
+
+Trigger scale-out policies based on memory utilization:
+
+```bash
+# Allocate memory to increase utilization
+curl -X POST http://localhost:8080/alloc/500
+
+# Continue allocating to push past threshold
+curl -X POST http://localhost:8080/alloc/500
+```
+
+### Test 4: Recovery Scenario
+
+Verify the system handles instance recovery:
+
+```bash
+# Set instance down
+curl -X POST http://localhost:8080/down
+
+# Wait for auto-scaler to react...
+
+# Bring instance back up
 curl -X POST http://localhost:8080/up
-
-# Configure 3 second delay on health checks
-curl -X POST http://localhost:8080/wait/3
-
-# Health check now takes 3 seconds
-time curl http://localhost:8080/up
-
-# Allocate 100 MB of memory
-curl -X POST http://localhost:8080/alloc/100
-
-# Check status to see allocated memory
-curl http://localhost:8080/
-
-# Stop the server
-pkill server
 ```
 
 ## Error Handling
