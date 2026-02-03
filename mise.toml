@@ -1,3 +1,6 @@
+[tools]
+bottom = "latest"
+
 [tasks.build]
 description = "Build the server"
 run = "gcc -Wall -Wextra -O2 -pthread -o server server.c"
